@@ -144,6 +144,7 @@ if [ "$SKIP_APT" != "1" ]; then
     autoconf automake libtool \
     libeigen3-dev libyaml-cpp-dev \
     python3-numpy python3-matplotlib python3-pip python3-yaml python3-dev \
+    iproute2 net-tools procps \
     || die "基础构建包装不上"
 
   say "apt：ROS 组件（ros-base 变体里没有 tf / tf2 / eigen_conversions）"
@@ -158,11 +159,23 @@ if [ "$SKIP_APT" != "1" ]; then
   #   rospy tf tf2_ros std_msgs sensor_msgs nav_msgs geometry_msgs
   #   ackermann_msgs rosgraph_msgs cv_bridge tesse + 自生成的 msg/srv
   # 注意 tf2 与 tf2_ros 是**两个包**，只装前者会 import tf2_ros 失败。
-  apt-get install -y -qq --no-install-recommends \
-    ros-noetic-cv-bridge ros-noetic-image-transport \
-    ros-noetic-tf2-ros \
-    ros-noetic-ackermann_msgs ros-noetic-message-generation ros-noetic-message-runtime \
-    || warn "桥接依赖有告警；缺哪个 catkin build / 启动时都会点出来"
+  #
+  # ⚠️⚠️ Debian 包名里 **ROS 包名的下划线要换成连字符**：
+  #        ackermann_msgs → ros-noetic-ackermann-msgs   （**不是** ros-noetic-ackermann_msgs）
+  #     Run 6（38127572100）就是这里写成了下划线。更坑的是 apt-get 碰到一个
+  #     **不存在的包名会整批原子失败** —— 那一批里的 cv_bridge / image_transport /
+  #     tf2_ros 也一起没装成（它们只是恰好被 ros-base 镜像自带才没暴露出来），
+  #     于是一直跑到 11 分钟后 roslaunch 起节点，才以
+  #         ModuleNotFoundError: No module named 'ackermann_msgs'
+  #     炸出来。实测核过：全站 `ros-noetic-ackermann-msgs` 221 处，
+  #     `ros-noetic-ackermann_msgs` **0 处**。
+  #     所以这里改成**逐个装**：一个名字错不会连带拖垮其余五个。
+  for p in ros-noetic-cv-bridge ros-noetic-image-transport ros-noetic-tf2-ros \
+           ros-noetic-ackermann-msgs ros-noetic-message-generation \
+           ros-noetic-message-runtime; do
+    apt-get install -y -qq --no-install-recommends "$p" \
+      || warn "  $p 装不上（继续；下面的依赖自检会收口）"
+  done
 
   say "apt：桥接 python 侧的 scipy / opencv / empy"
   # ROS/setup.py 的 install_requires 声明了 tesse / empy / opencv-python / scipy，
@@ -218,6 +231,60 @@ fi
 # =============================================================================
 # shellcheck disable=SC1091
 ros_source /opt/ros/noetic/setup.bash
+
+# ---------------------------------------------------------------------------
+# 依赖自检 —— 不赌「apt 包名拼对」，直接按**模块能不能 import** 验（Run 6 的教训）
+# ---------------------------------------------------------------------------
+# Run 6 花了 11.5 分钟才炸，报的是 ModuleNotFoundError: No module named
+# 'ackermann_msgs'，根因是 apt 包名写成下划线（见上面那段注释）。
+# 这里在**catkin 编译之前**把桥接节点要用的 python 模块逐个 import 一遍：
+# 缺哪个当场补装，补完还缺就立刻 die。好处是把 11 分钟的白跑压到 4 分钟，
+# 并且把「到底是哪个包 / 哪个模块缺了」直接写进 CI 日志。
+say "依赖自检：桥接节点用到的 python 模块"
+# 「模块 deb 包名」逐行列出。⚠️ 右边一律是**连字符**（ROS 包名的下划线在 deb 名里换连字符）。
+# 刻意不用 `declare -A`（关联数组要 bash 4+）—— 普通索引数组两种 bash 都能跑，
+# 也便于在本机（macOS 自带 bash 3.2）直接实测。
+MOD_DEB=(
+  "numpy           python3-numpy"
+  "scipy           python3-scipy"
+  "cv2             python3-opencv"
+  "yaml            python3-yaml"
+  "defusedxml      python3-defusedxml"
+  "tf              ros-noetic-tf"
+  "tf2_ros         ros-noetic-tf2-ros"
+  "eigen_conversions ros-noetic-eigen-conversions"
+  "cv_bridge       ros-noetic-cv-bridge"
+  "image_transport ros-noetic-image-transport"
+  "ackermann_msgs  ros-noetic-ackermann-msgs"
+  "rosgraph_msgs   ros-noetic-rosgraph-msgs"
+)
+miss_pkgs=""
+for pair in "${MOD_DEB[@]}"; do
+  mod="${pair%% *}"
+  deb="${pair##* }"
+  if ! python3 -c "import $mod" >/dev/null 2>&1; then
+    warn "缺模块 $mod  → 补装 $deb"
+    miss_pkgs="$miss_pkgs $deb"
+  fi
+done
+if [ -n "$miss_pkgs" ]; then
+  # shellcheck disable=SC2086
+  for p in $miss_pkgs; do
+    apt-get install -y -qq --no-install-recommends "$p" || warn "  $p 仍装不上"
+  done
+fi
+still=""
+for pair in "${MOD_DEB[@]}"; do
+  mod="${pair%% *}"
+  python3 -c "import $mod" >/dev/null 2>&1 || still="$still $mod"
+done
+if [ -n "$still" ]; then
+  warn "补装后仍缺这些模块：$still"
+  warn "查法：apt-cache policy <deb 包名>；ROS 包名里的下划线在 deb 名里是连字符。"
+  die "桥接 python 依赖不齐 —— roslaunch 起节点必然 ModuleNotFoundError"
+fi
+note "python 依赖自检通过（${#MOD_DEB[@]} 个模块）"
+
 WS="${WS:-$HOME/vnav_ws}"
 say "重建工作区 $WS"
 rm -rf "$WS"; mkdir -p "$WS/src"

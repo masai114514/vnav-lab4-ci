@@ -61,15 +61,20 @@ if [ "$SKIP_APT" != "1" ]; then
   apt-get update -qq || warn "apt-get update 有告警"
   apt-get install -y -qq --no-install-recommends \
     xvfb x11-utils xdotool imagemagick ffmpeg curl unzip ca-certificates git \
+    iproute2 net-tools procps \
     libgl1-mesa-dri libglx-mesa0 libglu1-mesa mesa-utils \
     libxcursor1 libxrandr2 libxinerama1 libxi6 libxss1 libasound2 \
     libnss3 libgbm1 libgconf-2-4 \
     ros-noetic-tf ros-noetic-tf2 ros-noetic-tf2-eigen ros-noetic-eigen-conversions \
     ros-noetic-cv-bridge ros-noetic-roslaunch ros-noetic-rosbag ros-noetic-tf2-ros \
-    ros-noetic-ackermann_msgs ros-noetic-message-generation ros-noetic-message-runtime \
+    ros-noetic-ackermann-msgs ros-noetic-message-generation ros-noetic-message-runtime \
     python3-pip python3-scipy python3-opencv python3-empy python3-defusedxml \
     python-is-python3 \
     || warn "部分包装不上，继续"
+  # ⚠️ 上面 `ros-noetic-ackermann-msgs` 是**连字符**。Run 6（official_race.sh）这里
+  #    曾写成下划线 `ackermann_msgs`，而 apt 遇到不存在的包名会**整批原子失败**，
+  #    把 cv_bridge / tf2_ros 也一起拖下水。改这段时别再写回下划线。
+  #    （official_race.sh 里已经改成逐个装 + 模块自检收口。）
   # 桥接脚本 shebang 是 `#!/usr/bin/env python`，而 focal 默认只有 python3 →
   # roslaunch 起节点时 `/usr/bin/env: 'python': No such file or directory`，exit 127。
   # 见 official_race.sh 里同名段落（Run 5 就死在这）。
