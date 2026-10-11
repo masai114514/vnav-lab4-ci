@@ -77,6 +77,12 @@ LAG_DURATION="${LAG_DURATION:-120}"
 # 录屏开关：BAG_ONLY=1 只出 bag（省 CPU，用于纯算法迭代）
 BAG_ONLY="${BAG_ONLY:-0}"
 
+# 桥接是否发 IMU。launch 里默认 true（200 Hz）。我们的 controller_node 只订阅
+# /current_state 与 /desired_state，**从不读 IMU**，所以默认关掉：
+# 200 Hz 的 UDP 收包 + 反序列化 + 话题发布在 4 核机器上是白烧 CPU。
+# 想完全照官方原样跑就传 PUBLISH_IMU=true。
+PUBLISH_IMU="${PUBLISH_IMU:-false}"
+
 LAB4_ZIP_URL="${LAB4_ZIP_URL:-https://vnav.mit.edu/material/lab4.zip}"
 
 JOBS="${JOBS:-$(nproc)}"
@@ -90,6 +96,18 @@ note() { printf '\033[1;35m[race]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[race]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[race] %s\033[0m\n' "$*" >&2; exit 1; }
 indent() { sed 's/^/    /'; }
+
+# 本脚本跑在 `set -u`（nounset）下，但 ROS 的 setup.bash 会连带 source 一批
+# /opt/ros/noetic/etc/catkin/profile.d/*.sh，里面**有对未定义变量的引用**：
+#     .../profile.d/10.roslaunch.sh: line 3: ROS_MASTER_URI: unbound variable
+# 于是 source 当场中止、脚本一步都没跑。实测就是这么挂的。
+# 所以凡 source ROS 的环境，一律临时关掉 nounset 再开回来。
+ros_source() {
+  set +u
+  # shellcheck disable=SC1090,SC1091
+  . "$1"
+  set -u
+}
 
 mkdir -p "$OUT"
 [ -d "$BUNDLE/dependencies" ] || die "BUNDLE=$BUNDLE 下没有 dependencies/ —— 仓库布局不对（应为 <repo>/lab4/dependencies）"
@@ -126,10 +144,23 @@ if [ "$SKIP_APT" != "1" ]; then
     ros-noetic-roslaunch ros-noetic-rosbag ros-noetic-roslint \
     || warn "补装 ROS 组件有告警，继续（缺什么下面 catkin 会报）"
 
-  say "apt：桥接依赖 cv_bridge"
+  say "apt：桥接依赖 cv_bridge / ackermann_msgs / message_generation / tf2_ros"
+  # 逐个对着 tesse_ros_node.py 的 import 核过：
+  #   rospy tf tf2_ros std_msgs sensor_msgs nav_msgs geometry_msgs
+  #   ackermann_msgs rosgraph_msgs cv_bridge tesse + 自生成的 msg/srv
+  # 注意 tf2 与 tf2_ros 是**两个包**，只装前者会 import tf2_ros 失败。
   apt-get install -y -qq --no-install-recommends \
     ros-noetic-cv-bridge ros-noetic-image-transport \
-    || warn "cv_bridge 装不上；桥接本身是纯 python 节点，多数情况仍能跑"
+    ros-noetic-tf2-ros \
+    ros-noetic-ackermann_msgs ros-noetic-message-generation ros-noetic-message-runtime \
+    || warn "桥接依赖有告警；缺哪个 catkin build / 启动时都会点出来"
+
+  say "apt：桥接 python 侧的 scipy / opencv / empy"
+  # ROS/setup.py 的 install_requires 声明了 tesse / empy / opencv-python / scipy，
+  # 但 catkin 的 setup.py 不会真的去 pip 装它们，得我们自己备齐。
+  apt-get install -y -qq --no-install-recommends \
+    python3-scipy python3-opencv python3-empy python3-defusedxml \
+    || warn "部分 python 包装不上，继续"
 
   say "apt：图形栈（Xvfb + Mesa llvmpipe + 截图/录屏 + 发键）"
   apt-get install -y -qq --no-install-recommends \
@@ -139,8 +170,10 @@ if [ "$SKIP_APT" != "1" ]; then
     libnss3 libgbm1 libgconf-2-4 \
     || warn "部分图形包装不上 —— Unity 缺 .so 会体现在 unity.log 里，先继续"
 
-  # 容器里没有声卡，给 ALSA 一个 null 设备，免得 Unity 一直刷音频报错
-  printf 'pcm.!default { type null }\nctl.!default { type null }\n' > /root/.asoundrc
+  # 容器里没有声卡，给 ALSA 一个 null 设备，免得 Unity 一直刷音频报错。
+  # 注意用 $HOME —— GitHub 的容器 job 把 HOME 设成 /github/home，不是 /root。
+  # （上一步写死 /root/.asoundrc 就是错的。）
+  printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
 
   command -v catkin >/dev/null 2>&1 || pip3 install -q catkin_tools || die "catkin_tools 装不上"
 fi
@@ -152,7 +185,7 @@ fi
 #    本身就是包，按目录拷。
 # =============================================================================
 # shellcheck disable=SC1091
-source /opt/ros/noetic/setup.bash
+ros_source /opt/ros/noetic/setup.bash
 WS="${WS:-$HOME/vnav_ws}"
 say "重建工作区 $WS"
 rm -rf "$WS"; mkdir -p "$WS/src"
@@ -189,32 +222,55 @@ if [ -f "$WS/src/nlopt/CMakeLists.txt" ]; then
   grep -nE "BUILD_COMMAND" "$WS/src/nlopt/CMakeLists.txt" | indent
 fi
 
-# --- 官方 TESSE 桥接 ---------------------------------------------------------
-# 仓名是 MIT-TESSE/tesse-ros-bridge（不是 MIT-SPARK，一次就找错的那个）。
-# 纯 python 节点 + 少量 srv，是 catkin 包，依赖 catkin_simple（上面已拷）与 cv_bridge。
-say "clone tesse-ros-bridge"
-git clone -q --depth 1 https://github.com/MIT-TESSE/tesse-ros-bridge.git \
-    "$WS/src/tesse_ros_bridge" || die "clone tesse-ros-bridge 失败"
-# 少数 tag 会把 catkin 包放在子目录里，兜一下
-if [ ! -f "$WS/src/tesse_ros_bridge/package.xml" ]; then
-  found="$(find "$WS/src/tesse_ros_bridge" -maxdepth 3 -name package.xml | head -1)"
-  if [ -n "$found" ]; then
-    warn "catkin 包不在仓根，提升 $(dirname "$found")"
-    mv "$WS/src/tesse_ros_bridge" "$WS/src/_tesse_ros_bridge_tmp"
-    mv "$(dirname "$found")" "$WS/src/tesse_ros_bridge"
-    mv "$WS/src/_tesse_ros_bridge_tmp" "$WS/src/tesse_ros_bridge_src" 2>/dev/null || true
-  fi
-fi
+# --- 官方 TESSE 桥接（ROS1 版）------------------------------------------------
+# 来源是 MIT-SPARK/VNAV-labs 的 **tag `VNAV2021`**，不是 MIT-TESSE/tesse-ros-bridge。
+# 为什么（2026-10-11 实测查清，别再改回去）：
+#   · MIT-TESSE/tesse-ros-bridge 的 master 已经是 **ROS 2** 分支 ——
+#     launch 用 `exec:` / `find-pkg-share` / `remap: from..to`，与我们 ROS1 的
+#     catkin/roslaunch 完全不兼容，而且里面已经没有 quadrotor_control_interface 了。
+#   · 课程 ROS1 那一版（2021 年）躺在 VNAV-labs 的 `VNAV2021` tag 里：
+#         lab3/tesse-ros-bridge/ROS/             ← catkin 包 `tesse_ros_bridge`
+#         lab3/tesse-ros-bridge/tesse-interface/ ← `tesse` python 客户端库
+#     我们的 Unity 构建叫 `vnav-2021-lab4.x86_64`，正是这一代。
+#   · 顺带核过：该 tag 下 `lab4/dependencies/` 的 8 个包与我们本地**逐项一致**。
+VNAV_TAG="${VNAV_TAG:-VNAV2021}"
+VNAV_URL="${VNAV_URL:-https://github.com/MIT-SPARK/VNAV-labs.git}"
+VNAV_DIR="${VNAV_DIR:-$HOME/vnav-labs}"
+BRIDGE_SRC="$VNAV_DIR/lab3/tesse-ros-bridge"
 
-# tesse-interface 提供 `tesse` 客户端库，是 setup.py 包，不进 catkin
-say "clone tesse-interface"
-if [ ! -d "$HOME/tesse-interface/.git" ]; then
-  git clone -q --depth 1 https://github.com/MIT-TESSE/tesse-interface.git \
-      "$HOME/tesse-interface" || warn "clone tesse-interface 失败（若桥接不需要它可忽略）"
+if [ ! -d "$VNAV_DIR/.git" ]; then
+  say "clone VNAV-labs @ $VNAV_TAG（约 2.5 MB）"
+  git clone -q --depth 1 --branch "$VNAV_TAG" "$VNAV_URL" "$VNAV_DIR" \
+    || die "clone VNAV-labs 失败（tag $VNAV_TAG 不存在？）"
 fi
-if [ -f "$HOME/tesse-interface/setup.py" ]; then
-  ( cd "$HOME/tesse-interface" && pip3 install -q -e . ) || warn "pip install tesse-interface 失败"
-fi
+[ -f "$BRIDGE_SRC/ROS/package.xml" ] || \
+  die "在 $BRIDGE_SRC/ROS 下找不到 package.xml —— tag 内容变了？"
+
+say "拷贝 catkin 包 tesse_ros_bridge"
+cp -r "$BRIDGE_SRC/ROS" "$WS/src/tesse_ros_bridge"
+# 清掉 py2 时代的 .pyc（对 py3 无用，还会干扰 rospack 的可执行文件搜索）
+find "$WS/src/tesse_ros_bridge" -name '*.pyc' -delete 2>/dev/null || true
+# ROS/setup.py 里 packages=['tesse_ros_bridge', 'key_teleop']，但上游的
+# src/key_teleop/ 只有 LICENSE 与 key_teleop.py，**没有 __init__.py**。
+# setuptools 对「显式列出的包目录缺 __init__.py」会告警（新版可能直接失败），
+# 补一个空文件最省事。
+KEYINIT="$WS/src/tesse_ros_bridge/src/key_teleop/__init__.py"
+[ -f "$KEYINIT" ] || : > "$KEYINIT"
+# launch 用的是 type="tesse_ros_node.py" —— 脚本名。ROS1 靠 rospack 在包目录里
+# **递归找可执行文件**来解析，所以这两个 .py 的可执行位必须留着（上游是 100755）。
+ls -l "$WS/src/tesse_ros_bridge/src/tesse_ros_bridge/"*.py | indent
+
+# `tesse` python 客户端库。它的 setup.py 里 install_requires =
+# ['numpy >= 1.16.0', 'defusedxml >= 0.6.0', 'Pillow >= 5.0.0', 'enum34 >= 1.1.10']，
+# 而 **enum34 只有 py2 能装**（py3 上 pip 直接报错）。所以：先手动备齐前三个，
+# 再用 --no-deps 装本体。
+say "装 tesse-interface（跳过 py2-only 的 enum34）"
+pip3 install -q numpy defusedxml Pillow || warn "numpy/defusedxml/Pillow 有告警"
+pip3 install -q -e "$BRIDGE_SRC/tesse-interface" --no-deps \
+  || die "pip install tesse-interface 失败"
+python3 -c "import tesse" 2>/dev/null \
+  && note "tesse 模块导入 OK" \
+  || warn "tesse 模块导入失败 —— tesse_ros_node 会起不来"
 
 # --- 构建 --------------------------------------------------------------------
 cd "$WS" || die "cd $WS 失败"
@@ -228,7 +284,7 @@ if ! catkin build -j"$JOBS" --no-status; then
   die "构建未通过"
 fi
 # shellcheck disable=SC1091
-source "$WS/devel/setup.bash"
+ros_source "$WS/devel/setup.bash"
 rospack find trajectory_generation >/dev/null || die "找不到 trajectory_generation 包"
 rospack find planner_pkg          >/dev/null || die "找不到 planner_pkg 包"
 rospack find controller_pkg       >/dev/null || die "找不到 controller_pkg 包"
@@ -356,12 +412,15 @@ rosparam set /use_sim_time true
 say "控制回路频率 /hz = $CTRL_HZ（官方起点是 1000，这里按 runner 的 CPU 余量降）"
 rosparam set /hz "$CTRL_HZ"
 
-say "roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch"
+say "roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch（publish_imu=$PUBLISH_IMU）"
 # use_broadcast 保持官方默认 true。
 # tesse_ros_node.py 里写的是 `if self.use_broadcast: udp_host = '<broadcast>'` ——
 # 改成 false 会把 UDP 监听绑到 self_ip:9004 的**单播**地址，而 Unity 侧是往广播
 # 地址发 metadata 的 → 直接丢 /current_state，整条链路废掉。
+#
+# 其余参数一律用 launch 默认，只动 publish_imu（理由见文件头参数区）。
 roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch \
+    publish_imu:="$PUBLISH_IMU" \
     > "$OUT/bridge.log" 2>&1 &
 PIDS+=("$!")
 

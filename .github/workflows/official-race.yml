@@ -42,6 +42,10 @@ on:
         description: '1 = 只出 bag 不录屏（省 CPU，纯算法迭代用）'
         required: false
         default: '0'
+      publish_imu:
+        description: '桥接是否发 IMU（我们的控制器不读它，默认关掉省 CPU）'
+        required: false
+        default: 'false'
       probe_only:
         description: '1 = 只跑快探针（不竞速），0 = 跑完整链路'
         required: false
@@ -120,6 +124,7 @@ jobs:
           UPSCALE: ${{ inputs.upscale }}
           ARM_KEY: ${{ inputs.arm_key }}
           BAG_ONLY: ${{ inputs.bag_only }}
+          PUBLISH_IMU: ${{ inputs.publish_imu }}
         run: |
           # 没有这行，`... | tee log` 的退出码会被 tee 吃掉 ——
           # 上一轮就是因此「空产物 + conclusion=success」。

@@ -48,6 +48,9 @@ bash fetch_artifacts.sh <run_id>     # 取指定运行
    `tesse_ros_node.py` 里是 `if self.use_broadcast: udp_host = '<broadcast>'`，
    改成 `false` 会把 UDP 监听绑到 `self_ip:9004` 的**单播**地址，而 Unity 往广播地址
    发 metadata → 直接丢 `/current_state`，整条链路废掉。
+   （注意：**代码里的默认值是 `False`**，是 `tesse_quadrotor_bridge.launch` 里的
+   `<arg name="use_broadcast" default="true"/>` 传下去才让它生效的 —— 所以别只改
+   launch 里的 arg 就算完，也别去改 py 里的默认值。）
 
 2. **等 Unity 就绪要用「端口能连上」，不能用「睡 N 秒」。**
    开发构建首次加载场景很慢，写死等待会在 `loading new scene...` 就判负 →
@@ -55,6 +58,33 @@ bash fetch_artifacts.sh <run_id>     # 取指定运行
 
 3. **`bash x.sh | tee log` 的退出码来自 `tee`。**
    不在 workflow 里加 `set -o pipefail`，脚本失败也会显示 success、留下空产物。
+
+## 桥接从哪来（2026-10-11 查清，别再改回去）
+
+**不是** `MIT-TESSE/tesse-ros-bridge` —— 那个仓的 master 已经是 **ROS 2** 分支：
+launch 用 `exec:` / `find-pkg-share` / `remap: from..to`，和我们 ROS1 的 catkin/roslaunch
+完全不兼容，而且它里面**已经没有** `quadrotor_control_interface` 了。
+
+课程 ROS1 那一版（2021 年）躺在 **`MIT-SPARK/VNAV-labs` 的 tag `VNAV2021`**：
+
+```bash
+git clone --depth 1 --branch VNAV2021 https://github.com/MIT-SPARK/VNAV-labs.git
+#   lab3/tesse-ros-bridge/ROS/           ← catkin 包 tesse_ros_bridge（拷进 WS/src）
+#   lab3/tesse-ros-bridge/tesse-interface/ ← python 库 tesse（pip install -e）
+```
+
+三个旁证：① 我们的 Unity 构建就叫 `vnav-2021-lab4.x86_64`，正是这一代；
+② 该 tag 下 `lab4/dependencies/` 的 8 个包与本项目**逐项一致**；
+③ 该 tag 的 `ROS/` 里 `tesse_ros_node.py`（46 KB, 755）与
+`quadrotor_control_interface.py` 都在，launch 也是 `tesse_quadrotor_bridge.launch`。
+
+配角两处（否则起不来）：
+
+- `tesse-interface/setup.py` 的 `install_requires` 含 `enum34` —— 只有 py2 能装，
+  py3 上直接报错。所以先手动装 `numpy defusedxml Pillow`，再
+  `pip3 install -e <path> --no-deps`。
+- `ROS/setup.py` 声明 `packages=['tesse_ros_bridge','key_teleop']`，但上游
+  `src/key_teleop/` 里没有 `__init__.py` —— 脚本里补一个空文件。
 
 ## 产物
 

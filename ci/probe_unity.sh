@@ -32,6 +32,15 @@ warn() { printf '\033[1;33m[probe]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[probe] %s\033[0m\n' "$*" >&2; exit 1; }
 indent() { sed 's/^/    /'; }
 
+# 见 official_race.sh 里的同名函数：ROS 的 setup.bash 会在 profile.d 里引用未定义
+# 变量（10.roslaunch.sh: ROS_MASTER_URI: unbound variable），在 set -u 下直接中止。
+ros_source() {
+  set +u
+  # shellcheck disable=SC1090,SC1091
+  . "$1"
+  set -u
+}
+
 mkdir -p "$OUT"
 PIDS=()
 killall_bg() {
@@ -49,33 +58,53 @@ if [ "$SKIP_APT" != "1" ]; then
   say "apt 装图形栈与 ROS 组件"
   apt-get update -qq || warn "apt-get update 有告警"
   apt-get install -y -qq --no-install-recommends \
-    xvfb x11-utils xdotool imagemagick ffmpeg curl unzip ca-certificates \
+    xvfb x11-utils xdotool imagemagick ffmpeg curl unzip ca-certificates git \
     libgl1-mesa-dri libglx-mesa0 libglu1-mesa mesa-utils \
     libxcursor1 libxrandr2 libxinerama1 libxi6 libxss1 libasound2 \
     libnss3 libgbm1 libgconf-2-4 \
     ros-noetic-tf ros-noetic-tf2 ros-noetic-tf2-eigen ros-noetic-eigen-conversions \
-    ros-noetic-cv-bridge ros-noetic-roslaunch ros-noetic-rosbag \
+    ros-noetic-cv-bridge ros-noetic-roslaunch ros-noetic-rosbag ros-noetic-tf2-ros \
+    ros-noetic-ackermann_msgs ros-noetic-message-generation ros-noetic-message-runtime \
+    python3-pip python3-scipy python3-opencv python3-empy python3-defusedxml \
     || warn "部分包装不上，继续"
-  printf 'pcm.!default { type null }\nctl.!default { type null }\n' > /root/.asoundrc
+  command -v catkin >/dev/null 2>&1 || pip3 install -q catkin_tools || die "catkin_tools 装不上"
+  # $HOME 在容器 job 里是 /github/home，不是 /root
+  printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
 fi
 
-source /opt/ros/noetic/setup.bash
+ros_source /opt/ros/noetic/setup.bash
 
-# 桥接：有现成工作区就用，没有就现场拉一份最小工作区
+# 桥接：有现成工作区就用（official_race.sh 建的），没有就现场拉一份最小工作区。
+# 桥接来源见 official_race.sh 的说明：必须用 MIT-SPARK/VNAV-labs 的 tag VNAV2021，
+# MIT-TESSE/tesse-ros-bridge 的 master 已经是 ROS2 分支，不兼容。
+VNAV_TAG="${VNAV_TAG:-VNAV2021}"
+VNAV_DIR="${VNAV_DIR:-$HOME/vnav-labs}"
+BRIDGE_SRC="$VNAV_DIR/lab3/tesse-ros-bridge"
 WS="${WS:-$HOME/vnav_ws}"
+
 if [ -f "$WS/devel/setup.bash" ]; then
   note "复用已有工作区 $WS"
-  source "$WS/devel/setup.bash"
+  ros_source "$WS/devel/setup.bash"
 else
   say "没有现成工作区，只拉桥接做最小构建"
+  [ -d "$VNAV_DIR/.git" ] || \
+    git clone -q --depth 1 --branch "$VNAV_TAG" \
+      "${VNAV_URL:-https://github.com/MIT-SPARK/VNAV-labs.git}" "$VNAV_DIR" \
+    || die "clone VNAV-labs @ $VNAV_TAG 失败"
   mkdir -p "$WS/src"
-  [ -d "$WS/src/tesse_ros_bridge" ] || \
-    git clone -q --depth 1 https://github.com/MIT-TESSE/tesse-ros-bridge.git "$WS/src/tesse_ros_bridge" \
-    || die "clone tesse-ros-bridge 失败"
+  [ -d "$WS/src/tesse_ros_bridge" ] || cp -r "$BRIDGE_SRC/ROS" "$WS/src/tesse_ros_bridge"
+  find "$WS/src/tesse_ros_bridge" -name '*.pyc' -delete 2>/dev/null || true
+  # setup.py 声明了 packages=['tesse_ros_bridge','key_teleop']，而 key_teleop/ 没有 __init__.py
+  [ -f "$WS/src/tesse_ros_bridge/src/key_teleop/__init__.py" ] || \
+    : > "$WS/src/tesse_ros_bridge/src/key_teleop/__init__.py"
   [ -d "$WS/src/catkin_simple" ] || cp -r "$BUNDLE/dependencies/catkin_simple" "$WS/src/" 2>/dev/null || true
+  [ -d "$WS/src/mav_comm" ] || { for sub in "$BUNDLE"/dependencies/mav_comm/*/; do
+      [ -f "$sub/package.xml" ] && cp -r "$sub" "$WS/src/"; done; }
+  pip3 install -q numpy defusedxml Pillow 2>/dev/null || true
+  pip3 install -q -e "$BRIDGE_SRC/tesse-interface" --no-deps || warn "tesse-interface 装不上"
   ( cd "$WS" && catkin config --cmake-args -DCMAKE_BUILD_TYPE=Release >/dev/null \
       && catkin build tesse_ros_bridge -j"$JOBS" --no-status ) || die "桥接构建失败"
-  source "$WS/devel/setup.bash"
+  ros_source "$WS/devel/setup.bash"
 fi
 
 # ---- 下 Unity ---------------------------------------------------------------
