@@ -389,7 +389,12 @@ readiness_marker() {
 }
 
 unity_ready() {
-  local timeout="$1" end=$((SECONDS + timeout))
+  # ⚠️ 千万别把这两行合写成 `local wait_s="$1" end=$((SECONDS + wait_s))` ——
+  # `local` 命令的右侧展开在声明**生效之前**完成，`$wait_s` 会去外层作用域找，
+  # 在 `set -u` 下直接 `wait_s: unbound variable` 崩掉。
+  # 这不是理论：Run 4（38126371856）就是这么在 248 s 处一步崩掉的。
+  local wait_s="$1"
+  local end=$((SECONDS + wait_s))
   while [ "$SECONDS" -lt "$end" ]; do
     pgrep -f "$UNITY_NAME" >/dev/null 2>&1 || return 2   # 进程没了就别等
     readiness_marker && return 0

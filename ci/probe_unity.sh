@@ -147,7 +147,9 @@ readiness_marker() {
 }
 
 unity_ready() {
-  local timeout="$1" end=$((SECONDS + timeout))
+  # 同 official_race.sh：两个 local 必须分开写（`local a=.. b=$a` 的 $a 是外层作用域）
+  local wait_s="$1"
+  local end=$((SECONDS + wait_s))
   while [ "$SECONDS" -lt "$end" ]; do
     pgrep -f "$UNITY_NAME" >/dev/null 2>&1 || return 2
     readiness_marker && return 0
