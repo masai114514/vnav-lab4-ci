@@ -184,6 +184,29 @@ if [ "$SKIP_APT" != "1" ]; then
   # （上一步写死 /root/.asoundrc 就是错的。）
   printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
 
+  # ---------------------------------------------------------------------------
+  # `python` 解释器 —— Run 5（38126738778）就是死在这，exit code 127
+  # ---------------------------------------------------------------------------
+  # 桥接的 py 脚本 shebang 是 `#!/usr/bin/env python`（Py2 时代的写法）。
+  # ROS Noetic 本体是 py3，但**这两个脚本的 shebang 没人改过**；而 Ubuntu 20.04
+  # 默认只装 python3，`python` 这个命令**根本不存在**，于是 roslaunch 起节点时：
+  #     /usr/bin/env: 'python': No such file or directory
+  #     [tesse/tesse_ros_bridge-1] process has died [pid -1, exit code 127]
+  # 桥接两个节点当场全灭 → /current_state 永远不来 → 整趟没有任何产物。
+  # `python-is-python3` 是 ROS Noetic 的官方配套，提供 /usr/bin/python → python3。
+  say "apt：python-is-python3（/usr/bin/python → python3 的链接）"
+  apt-get install -y -qq --no-install-recommends python-is-python3 \
+    || warn "python-is-python3 装不上 —— 下面手动建链接兜底"
+
+  # 双保险：个别镜像没这个包，或被 --no-install-recommends 掉。
+  if ! command -v python >/dev/null 2>&1; then
+    warn "系统里没有 python —— 手动链接到 python3（Noetic 本体就是 py3）"
+    ln -sf "$(command -v python3)" /usr/local/bin/python \
+      || die "建 python 链接失败"
+  fi
+  command -v python >/dev/null 2>&1 || die "没有 python 解释器，桥接必然起不来"
+  note "python → $(command -v python)  [$(python -V 2>&1)]"
+
   command -v catkin >/dev/null 2>&1 || pip3 install -q catkin_tools || die "catkin_tools 装不上"
 fi
 

@@ -68,7 +68,16 @@ if [ "$SKIP_APT" != "1" ]; then
     ros-noetic-cv-bridge ros-noetic-roslaunch ros-noetic-rosbag ros-noetic-tf2-ros \
     ros-noetic-ackermann_msgs ros-noetic-message-generation ros-noetic-message-runtime \
     python3-pip python3-scipy python3-opencv python3-empy python3-defusedxml \
+    python-is-python3 \
     || warn "部分包装不上，继续"
+  # 桥接脚本 shebang 是 `#!/usr/bin/env python`，而 focal 默认只有 python3 →
+  # roslaunch 起节点时 `/usr/bin/env: 'python': No such file or directory`，exit 127。
+  # 见 official_race.sh 里同名段落（Run 5 就死在这）。
+  if ! command -v python >/dev/null 2>&1; then
+    warn "没有 python —— 手动链接到 python3"
+    ln -sf "$(command -v python3)" /usr/local/bin/python || die "建 python 链接失败"
+  fi
+  command -v python >/dev/null 2>&1 || die "没有 python 解释器，桥接必然起不来"
   command -v catkin >/dev/null 2>&1 || pip3 install -q catkin_tools || die "catkin_tools 装不上"
   # $HOME 在容器 job 里是 /github/home，不是 /root
   printf 'pcm.!default { type null }\nctl.!default { type null }\n' > "$HOME/.asoundrc"
