@@ -241,22 +241,36 @@ ros_source /opt/ros/noetic/setup.bash
 # 缺哪个当场补装，补完还缺就立刻 die。好处是把 11 分钟的白跑压到 4 分钟，
 # 并且把「到底是哪个包 / 哪个模块缺了」直接写进 CI 日志。
 say "依赖自检：桥接节点用到的 python 模块"
-# 「模块 deb 包名」逐行列出。⚠️ 右边一律是**连字符**（ROS 包名的下划线在 deb 名里换连字符）。
+# 这张表 = 桥接源码**真实 import 到**的第三方顶层模块，一一对应（2026-10-11 逐行核过）：
+#   tesse_ros_node.py / quadrotor_control_interface.py:
+#       numpy  rospy  tf  tf2_ros  std_msgs  sensor_msgs  nav_msgs  geometry_msgs
+#       ackermann_msgs  rosgraph_msgs  cv_bridge        (+ scipy 见 utils.py)
+#   tesse 库的传递依赖（桥接 `from tesse.msgs/env/utils import *`）：
+#       numpy  defusedxml        （另 PIL 也是，但那是 pip 侧，见下面 pip 段的自检）
+#
+# ⚠️ 不要把 **C++ 专用包**抄进来：`eigen_conversions` / `image_transport` / `tf2_eigen`
+#    都**不提供 python 模块**，`import` 它们必然失败。Run 7（38128466328）就是我把
+#    apt 的安装列表直接当成模块表、多列了这两个，自检门在 105 s 误报 die ——
+#    当时真正的缺口只有 ackermann_msgs 一个。
+# ⚠️ 同理，桥接**不 import** 的也不要放进来（`cv2`、`yaml` 已被删掉，它们只在 apt
+#    装过、代码里根本没用到，放进来纯属增加误报面）。**这张表照 import 写，不要照 apt 写。**
+# ⚠️ 右边一律是**连字符**（ROS 包名的下划线在 deb 名里换连字符）。
 # 刻意不用 `declare -A`（关联数组要 bash 4+）—— 普通索引数组两种 bash 都能跑，
 # 也便于在本机（macOS 自带 bash 3.2）直接实测。
 MOD_DEB=(
-  "numpy           python3-numpy"
-  "scipy           python3-scipy"
-  "cv2             python3-opencv"
-  "yaml            python3-yaml"
-  "defusedxml      python3-defusedxml"
-  "tf              ros-noetic-tf"
-  "tf2_ros         ros-noetic-tf2-ros"
-  "eigen_conversions ros-noetic-eigen-conversions"
-  "cv_bridge       ros-noetic-cv-bridge"
-  "image_transport ros-noetic-image-transport"
-  "ackermann_msgs  ros-noetic-ackermann-msgs"
-  "rosgraph_msgs   ros-noetic-rosgraph-msgs"
+  "numpy            python3-numpy"
+  "scipy            python3-scipy"
+  "defusedxml       python3-defusedxml"
+  "rospy            ros-noetic-rospy"
+  "tf               ros-noetic-tf"
+  "tf2_ros          ros-noetic-tf2-ros"
+  "std_msgs         ros-noetic-std-msgs"
+  "sensor_msgs      ros-noetic-sensor-msgs"
+  "nav_msgs         ros-noetic-nav-msgs"
+  "geometry_msgs    ros-noetic-geometry-msgs"
+  "cv_bridge        ros-noetic-cv-bridge"
+  "ackermann_msgs   ros-noetic-ackermann-msgs"
+  "rosgraph_msgs    ros-noetic-rosgraph-msgs"
 )
 miss_pkgs=""
 for pair in "${MOD_DEB[@]}"; do
@@ -367,9 +381,16 @@ say "装 tesse-interface（跳过 py2-only 的 enum34）"
 pip3 install -q numpy defusedxml Pillow || warn "numpy/defusedxml/Pillow 有告警"
 pip3 install -q -e "$BRIDGE_SRC/tesse-interface" --no-deps \
   || die "pip install tesse-interface 失败"
-python3 -c "import tesse" 2>/dev/null \
-  && note "tesse 模块导入 OK" \
-  || warn "tesse 模块导入失败 —— tesse_ros_node 会起不来"
+# pip 侧的模块自检。这三个缺任何一个，桥接起节点都会 ModuleNotFoundError：
+#   PIL         ← `tesse.msgs` 的**模块级** `from PIL import Image`（桥接 import * 了它）
+#   defusedxml  ← `tesse.utils` 的模块级 import
+#   tesse       ← 桥接 `from tesse.msgs/env/utils import *`
+# 上面 apt 那张 MOD_DEB 表管不到它们（当时还没装），所以在这里单独收口。
+for mod in PIL defusedxml tesse; do
+  python3 -c "import $mod" >/dev/null 2>&1 \
+    || die "pip 侧模块 $mod 导不进来 —— 桥接必然起不来"
+done
+note "pip 侧模块自检通过（PIL / defusedxml / tesse）"
 
 # --- 构建 --------------------------------------------------------------------
 cd "$WS" || die "cd $WS 失败"
@@ -388,6 +409,18 @@ rospack find trajectory_generation >/dev/null || die "找不到 trajectory_gener
 rospack find planner_pkg          >/dev/null || die "找不到 planner_pkg 包"
 rospack find controller_pkg       >/dev/null || die "找不到 controller_pkg 包"
 rospack find tesse_ros_bridge     >/dev/null || warn "找不到 tesse_ros_bridge 包 —— 桥接启动会失败"
+
+# 工作区侧的两个 python 模块**只有 catkin build 之后才存在**，所以自检要在这里补一次
+# （编译前那张 MOD_DEB 表管不到它们）：
+#   mav_msgs                  ← dependencies/mav_comm 编出来的，quadrotor_control_interface 要
+#   tesse_ros_bridge.msg/.srv ← 桥接自己的消息/服务，靠 message_generation 生成
+# 缺任何一个，roslaunch 起桥接都会 ModuleNotFoundError。在「编译刚结束」时就点出来，
+# 比等 Unity 启动完（再 +2 分钟）才炸划算得多。
+python3 -c "import mav_msgs.msg" >/dev/null 2>&1 \
+  || die "mav_msgs 不可 import —— mav_comm 没编出来？"
+python3 -c "import tesse_ros_bridge.msg, tesse_ros_bridge.srv" >/dev/null 2>&1 \
+  || die "tesse_ros_bridge 的 msg/srv 不可 import —— 消息生成失败？"
+note "工作区 python 模块自检通过（mav_msgs / tesse_ros_bridge.msg+srv）"
 note "工作区就绪：$WS"
 
 # =============================================================================
