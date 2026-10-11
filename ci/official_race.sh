@@ -26,11 +26,18 @@
 #    留在 MAKEFLAGS 里的 jobserver FD，而 EP 是经 `cmake -P` 调起的、FD 已失效 →
 #    `make[5]: *** write jobserver: Bad file descriptor. Stop.`
 #
-# 2) Unity 就绪用「**端口能连上**」判定，不用「睡 N 秒」。
-#    上一轮写死 UNITY_BOOT_WAIT=45，Unity 还停在 `loading new scene...`，
-#    桥接空等 → 整趟没有 bag、没有视频。这是那次失败的直接原因。
+# 2) Unity 就绪读 **Unity 自己日志里的监听器标记**，既不是「睡 N 秒」，
+#    也**不是**「TCP 探端口」——后者是 2026-10-11 Run 3 那次假故障的元凶：
+#    官方 launch 的端口分配是 position=9000 / metadata=9001 / image=9002 /
+#    udp(控制)=9004 / step=9005 / lidar=9006 / lidar_udp=9007，而
+#    **metadata 与 position 在 TESSE 里都是 UDP**，UDP 没有 listen 状态，
+#    `/dev/tcp/127.0.0.1/9001` 永远连不上 → Unity 早已 ready（它自己的日志里
+#    "Image request listener started" 与 "Metadata request listener started..."
+#    都打出来了）却被判成「没起来」，整趟 die 在起跑线上。
+#    （更早一轮是写死 UNITY_BOOT_WAIT=45，Unity 还停在 `loading new scene...`，
+#      桥接空等 → 没有 bag 没有视频。两次都不是「等得不够久」，是判据错。）
 #
-# 3) 失败**不静默**：关键门（Unity 端口、/current_state、bag 落盘）一律 die 非零退出。
+# 3) 失败**不静默**：关键门（Unity 就绪、/current_state、bag 落盘）一律 die 非零退出。
 #    上一轮用 `bash x.sh | tee log` 且脚本没有 -e，退出码被 tee 吃掉 →
 #    空产物也判 success。（本仓的 workflow 已加 `set -o pipefail` 双保险。）
 # =============================================================================
@@ -58,8 +65,10 @@ UPSCALE="${UPSCALE:-}"
 # 从渲染器手里抢走。controller_node 已把它开成参数（/hz）。
 CTRL_HZ="${CTRL_HZ:-200}"
 
-# 等 Unity 监听端口的超时 [s]。开发构建首次加载场景很慢，给足。
+# 等 Unity 的 TESSE 监听器就绪（读 unity.log 标记）的超时 [s]。开发构建首次加载场景很慢，给足。
 UNITY_BOOT_WAIT="${UNITY_BOOT_WAIT:-240}"
+# 监听器起了 ≠ 场景已经在跑。给物理/渲染一小段起步时间再上桥接。
+UNITY_SETTLE="${UNITY_SETTLE:-8}"
 # 等桥接出第一条 /current_state 的超时 [s]
 BRIDGE_WAIT="${BRIDGE_WAIT:-120}"
 # 竞速墙钟兜底超时 [s]
@@ -366,21 +375,40 @@ say "启动 Unity（窗口 ${RES}，force-glcore）"
     < /dev/null > "$OUT/unity_stdout.log" 2>&1 ) &
 PIDS+=("$!")
 
-# 就绪判据：Unity 的服务端端口能连上（而不是「睡 N 秒」）
-wait_port() {
-  local port="$1" timeout="$2"
-  local end=$((SECONDS + timeout))
+# ---------------------------------------------------------------------------
+# 就绪判据：读 Unity 自己的日志标记（**不要**改回 TCP 探端口，也不是睡 N 秒）
+# ---------------------------------------------------------------------------
+# TESSE 的 C# 各 interface 一进 Start() 就把自己的 listener 线程拉起来并打印
+#   "Image request listener started" / "Metadata request listener started..."
+# 这就是「服务端已可被访问」的权威信号。而端口本身探不得：
+#   metadata(9001) / position(9000) 都是 UDP，没有 listen 状态，
+#   /dev/tcp 连它必然失败（Run 3 就是这么被误判掉一整趟的）。
+readiness_marker() {
+  grep -aqE "Metadata request listener started|Image request listener started" \
+       "$OUT/unity.log" 2>/dev/null
+}
+
+unity_ready() {
+  local timeout="$1" end=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$end" ]; do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then return 0; fi
     pgrep -f "$UNITY_NAME" >/dev/null 2>&1 || return 2   # 进程没了就别等
+    readiness_marker && return 0
     sleep 2
   done
   return 1
 }
 
-say "等 Unity 监听 9001（服务端元数据口，最长 ${UNITY_BOOT_WAIT}s）"
-wait_port 9001 "$UNITY_BOOT_WAIT"
+say "等 Unity 的 TESSE 监听器就绪（读 unity.log 标记，最长 ${UNITY_BOOT_WAIT}s）"
+unity_ready "$UNITY_BOOT_WAIT"
 UP_RC=$?
+
+# 无论成败都落一份监听表：下次再遇到「端口/协议」类问题可以直接看，不用猜。
+{
+  echo "--- ss -lntup（TCP+UDP 全部监听/绑定）"
+  ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || echo "(既没有 ss 也没有 netstat)"
+} > "$OUT/sockets.txt" 2>&1 || true
+cat "$OUT/sockets.txt" | indent || true
+
 if [ "$UP_RC" = 2 ]; then
   warn "Unity 进程已退出。unity.log 尾部："
   tail -40 "$OUT/unity.log" 2>/dev/null | indent || true
@@ -389,13 +417,17 @@ if [ "$UP_RC" = 2 ]; then
   die "Unity 启动失败"
 fi
 if [ "$UP_RC" != 0 ]; then
-  warn "等满 ${UNITY_BOOT_WAIT}s 仍未监听 9001。unity.log 尾部："
+  warn "等满 ${UNITY_BOOT_WAIT}s 仍未见「监听器就绪」标记。unity.log 尾部："
   tail -40 "$OUT/unity.log" 2>/dev/null | indent || true
+  warn "unity_stdout.log 尾部："
+  tail -20 "$OUT/unity_stdout.log" 2>/dev/null | indent || true
   die "Unity 没起来（可调大 UNITY_BOOT_WAIT 重试）"
 fi
-note "Unity 已就绪 —— 帧率取证行（事件里的 Display / OPENGL LOG）："
+note "Unity 已就绪（TESSE 监听器已起）—— 帧率取证行（Unity 事件里的 Display / OPENGL LOG）："
 grep -aoE "Display [0-9]+ '[^']*': [0-9]+x[0-9]+|Creating OpenGL [0-9.]+ graphics device" \
      "$OUT/unity.log" 2>/dev/null | head -4 | indent || true
+note "再等 ${UNITY_SETTLE}s 让场景跑起来，然后上桥接"
+sleep "$UNITY_SETTLE"
 
 # =============================================================================
 # 5. ROS 桥接
@@ -446,13 +478,29 @@ note "/current_state 已到 —— 官方链路通了"
 if [ -n "$ARM_KEY" ]; then
   sleep "$ARM_DELAY"
   say "向 Unity 发上电键 '$ARM_KEY'"
+
+  # 先把窗口清单落盘。Unity Linux 独立构建的窗口标题是 ProductName，
+  # **未必**等于 $UNITY_WIN_NAME；万一名字对不上，日志里至少能看到真实标题。
+  # （只做诊断，不改变行为 —— 每次只动一个变量。）
+  {
+    echo "--- xdotool search --onlyvisible --name '.*'  →  id / 标题 / 几何"
+    for w in $(xdotool search --onlyvisible --name '.*' 2>/dev/null); do
+      printf '%s  |  %s  |  %s\n' "$w" \
+        "$(xdotool getwindowname "$w" 2>/dev/null)" \
+        "$(xdotool getwindowgeometry --shell "$w" 2>/dev/null | tr '\n' ' ')"
+    done
+  } > "$OUT/windows.txt" 2>&1 || true
+  cat "$OUT/windows.txt" | indent || true
+
   WID="$(xdotool search --name "$UNITY_WIN_NAME" 2>/dev/null | head -1)"
   if [ -n "$WID" ]; then
     xdotool windowfocus "$WID" 2>/dev/null || true
-    note "  窗口 id = $WID"
+    note "  窗口 id = $WID（匹配名 '$UNITY_WIN_NAME'）"
   else
-    warn "  xdotool 没找到名字含 '$UNITY_WIN_NAME' 的窗口，直接对焦点窗口发键"
+    warn "  没有名字含 '$UNITY_WIN_NAME' 的窗口 —— 见上面的窗口清单"
+    warn "  退化为对当前焦点窗口发键（Xvfb 无 WM，focus=PointerRoot）"
   fi
+  # 只按一次：W 很可能是 arm 的 toggle，连按两次会把它又关掉。
   xdotool key --clearmodifiers "$ARM_KEY" 2>/dev/null || warn "  xdotool 发键失败"
   sleep 2
 else

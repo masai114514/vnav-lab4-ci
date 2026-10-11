@@ -20,6 +20,8 @@ DISP="${DISP:-:99}"
 RES="${RES:-640x400}"
 XVFB_RES="${XVFB_RES:-$RES}"
 UNITY_BOOT_WAIT="${UNITY_BOOT_WAIT:-240}"
+# 监听器起了 ≠ 场景已经在跑，给一小段起步时间（与 official_race.sh 同口径）
+UNITY_SETTLE="${UNITY_SETTLE:-8}"
 BRIDGE_WAIT="${BRIDGE_WAIT:-120}"
 JOBS="${JOBS:-$(nproc)}"
 SKIP_APT="${SKIP_APT:-0}"
@@ -136,28 +138,43 @@ say "启动 Unity"
     < /dev/null > "$OUT/unity_stdout.log" 2>&1 ) &
 PIDS+=("$!")
 
-wait_port() {
-  local port="$1" timeout="$2" end=$((SECONDS + timeout))
+# 就绪判据与 official_race.sh 完全一致：读 Unity 日志里的监听器标记。
+# **不要**改回 /dev/tcp 探端口 —— metadata(9001)/position(9000) 都是 UDP，
+# 没有 listen 状态，TCP 探它必然失败（Run 3 一整趟就是这么被误判掉的）。
+readiness_marker() {
+  grep -aqE "Metadata request listener started|Image request listener started" \
+       "$OUT/unity.log" 2>/dev/null
+}
+
+unity_ready() {
+  local timeout="$1" end=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$end" ]; do
-    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
     pgrep -f "$UNITY_NAME" >/dev/null 2>&1 || return 2
+    readiness_marker && return 0
     sleep 2
   done
   return 1
 }
 
-say "等 Unity 监听 9001（最长 ${UNITY_BOOT_WAIT}s）"
-wait_port 9001 "$UNITY_BOOT_WAIT"; UP_RC=$?
+say "等 Unity 的 TESSE 监听器就绪（读 unity.log 标记，最长 ${UNITY_BOOT_WAIT}s）"
+unity_ready "$UNITY_BOOT_WAIT"; UP_RC=$?
+{
+  echo "--- ss -lntup（TCP+UDP 全部监听/绑定）"
+  ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || echo "(既没有 ss 也没有 netstat)"
+} > "$OUT/sockets.txt" 2>&1 || true
+cat "$OUT/sockets.txt" | indent || true
 if [ "$UP_RC" = 2 ]; then
   tail -40 "$OUT/unity.log" 2>/dev/null | indent || true
   die "Unity 进程死了"
 elif [ "$UP_RC" != 0 ]; then
   tail -40 "$OUT/unity.log" 2>/dev/null | indent || true
-  die "Unity 在 ${UNITY_BOOT_WAIT}s 内没监听 9001"
+  die "Unity 在 ${UNITY_BOOT_WAIT}s 内没打出监听器就绪标记"
 fi
-note "Unity 就绪："
+note "Unity 就绪（TESSE 监听器已起）："
 grep -aoE "Display [0-9]+ '[^']*': [0-9]+x[0-9]+|Creating OpenGL [0-9.]+ graphics device" \
      "$OUT/unity.log" 2>/dev/null | head -4 | indent || true
+note "再等 ${UNITY_SETTLE}s 让场景跑起来"
+sleep "$UNITY_SETTLE"
 
 # 帧时浮层连拍 3 张（间隔 8 s），用于读真实帧率
 say "抓帧时浮层（3 张，间隔 8 s）"
