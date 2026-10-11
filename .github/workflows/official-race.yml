@@ -71,33 +71,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 环境信息（私有仓 2 vCPU / 公开仓 4 vCPU）
+      # 注意：容器 job 里 runner 给的默认 shell 是 `sh`（dash），不是 bash ——
+      # 实测报 `set: Illegal option -o pipefail`，脚本一步都没跑。
+      # 所以凡是 run: 都要显式 `shell: bash`（GH 的 bash 模板已是
+      # `bash --noprofile --norc -eo pipefail`，自带 -e 与 pipefail）。
+      #
+      # 另外：`${{ github.workspace }}` 在这里求值成**主机**路径
+      # /home/runner/work/...，而容器内 `$GITHUB_WORKSPACE` 是 /__w/...。
+      # 两者指向同一个挂载，但字符串不同；为避免踩坑，一律用 step 的工作目录
+      # （脚本里直接 $PWD），不用表达式插值。
+      - name: 环境信息（公开仓 4 vCPU / 私有仓 2 vCPU）
+        shell: bash
         run: |
-          echo "vCPU    = $(nproc)"
-          free -m | awk '/Mem:/{printf "内存    = %s MB\n", $2}'
+          echo "vCPU     = $(nproc)"
+          free -m | awk '/Mem:/{printf "内存     = %s MB\n", $2}'
           grep -E '^PRETTY_NAME' /etc/os-release || true
-          echo "工作区  = $GITHUB_WORKSPACE"
-          echo "--- 可用的 ROS 包（前 10）"
-          ls /opt/ros/noetic/share | head -10
+          echo "工作目录 = $PWD"
+          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
+          echo "--- ROS 版本"
+          ls /opt/ros/noetic/share | wc -l | awk '{print "  /opt/ros/noetic/share 下 $1 个包"}'
 
       - name: 快探针（probe_only=1）
         if: ${{ inputs.probe_only == '1' }}
+        shell: bash
         env:
-          OUT: ${{ github.workspace }}/out
-          BUNDLE: ${{ github.workspace }}/lab4
           RES: ${{ inputs.res }}
           XVFB_RES: ${{ inputs.res }}
           UNITY_BOOT_WAIT: ${{ inputs.unity_boot_wait }}
         run: |
           set -o pipefail
+          export OUT="$PWD/out"
+          export BUNDLE="$PWD/lab4"
           mkdir -p "$OUT"
+          echo "OUT=$OUT  BUNDLE=$BUNDLE"
           bash ci/probe_unity.sh 2>&1 | tee "$OUT/probe_console.log"
 
       - name: 完整竞速链路
         if: ${{ inputs.probe_only != '1' }}
+        shell: bash
         env:
-          OUT: ${{ github.workspace }}/out
-          BUNDLE: ${{ github.workspace }}/lab4
           RES: ${{ inputs.res }}
           XVFB_RES: ${{ inputs.res }}
           CTRL_HZ: ${{ inputs.ctrl_hz }}
@@ -112,7 +124,11 @@ jobs:
           # 没有这行，`... | tee log` 的退出码会被 tee 吃掉 ——
           # 上一轮就是因此「空产物 + conclusion=success」。
           set -o pipefail
+          export OUT="$PWD/out"
+          export BUNDLE="$PWD/lab4"
           mkdir -p "$OUT"
+          echo "OUT=$OUT"
+          echo "BUNDLE=$BUNDLE"
           bash ci/official_race.sh 2>&1 | tee "$OUT/console.log"
 
       - name: 上传产物
@@ -126,31 +142,38 @@ jobs:
 
       - name: 结论摘要
         if: always()
+        shell: bash
         run: |
           {
             echo "## 官方 Unity 竞速 — 摘要"
             echo
             echo "- vCPU: $(nproc)"
-            echo "- run: $GITHUB_RUN_ID  触发参数见上方 job 配置"
             echo
             if [ -f out/lag_probe.txt ]; then
               echo '### /current_state 滞后实测（★ 核心指标）'
               echo '```'
-              sed -n '1,60p' out/lag_probe.txt
+              sed -n '1,60p' out/lag_probe.txt || true
               echo '```'
             else
               echo '_没有 lag_probe.txt_'
             fi
             echo
+            if [ -f out/osc_report.txt ]; then
+              echo '### xyz 振荡报告'
+              echo '```'
+              sed -n '1,80p' out/osc_report.txt || true
+              echo '```'
+            fi
+            echo
             if [ -f out/metrics.json ]; then
               echo '### metrics.json'
               echo '```json'
-              cat out/metrics.json
+              cat out/metrics.json || true
               echo '```'
             fi
             echo
             echo '### 产物清单'
             echo '```'
-            ls -la out/ 2>/dev/null
+            ls -la out/ 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
