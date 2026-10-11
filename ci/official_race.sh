@@ -678,7 +678,14 @@ PIDS+=("$!")
 sleep 5
 
 say "开始录 rosbag → $OUT/race.bag"
-"${CNICE[@]}" rosbag record -O "$OUT/race.bag" /current_state /desired_state /rotor_speed_cmds \
+# ⚠️ /clock 必须一起录：它是 use_sim_time 下**所有 ROS 定时器的驱动源**。
+#    桥接 tesse_ros_node.py 的 spin() 里是一个紧循环
+#        while not rospy.is_shutdown(): self.clock_cb(None)
+#    每轮同步 UDP 往返向 Unity 要一次 metadata，然后发一次 /clock。
+#    所以 **/clock 频率 = Unity 帧率 ≈ 50 Hz**，而每跳 20 ms = Unity 固定物理步长。
+#    控制器的 ros::Timer 挂在 ROS 时间上，只能跟着 /clock 跳 → 控制环被锁在 ~/clock。
+#    录下它，就能直接量「天花板在哪」而不必靠推断。
+"${CNICE[@]}" rosbag record -O "$OUT/race.bag" /clock /current_state /desired_state /rotor_speed_cmds \
     > "$OUT/rosbag.log" 2>&1 &
 BAG_PID=$!
 PIDS+=("$BAG_PID")
