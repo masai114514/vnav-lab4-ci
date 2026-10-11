@@ -1,8 +1,11 @@
 name: official-race
 
-# 手动触发。默认参数 = 「官方原样 + 两处已认过的修复（have_desired / hz=200）」，
-# 即 Run 1：只换机器（2 vCPU → 4 vCPU），不加任何新代码，用来隔离
-# 「发散到底是不是单纯 CPU 不够」这一个变量。
+# 手动触发。默认参数 = 「官方原样 + 已认过的修复（have_desired / hz=200）+ CPU 让给控制栈」。
+# 历史：Run 1–7 依次排掉 shell/set -u/就绪判据/local 语法/python 解释器/apt 包名/自检误报，
+# Run 8 首次全绿（609 s），拿到官方 Unity 的 bag + 视频 + lag_probe + osc_report。
+# Run 8 的结论：**滞后被证伪**（/current_state lag p95=60 ms < 姿态环 83 ms 时间常数），
+# 但控制回路只跑到 41 Hz（设定 200），且控制器输出有 47% 的时间处于 >100 ms 空档
+# → 新的头号嫌疑是 **CPU 抢占**。所以本轮的默认值把优先级倒过来给控制栈。
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +17,18 @@ on:
         description: '控制回路频率 /hz（官方起点是 1000）'
         required: false
         default: '200'
+      ctrl_nice:
+        description: '控制栈 renice 档数（正数 = 提优先级；0 = 不动）'
+        required: false
+        default: '5'
+      unity_nice:
+        description: 'Unity/录屏 renice 档数（正数 = 降优先级）'
+        required: false
+        default: '10'
+      lp_threads:
+        description: 'llvmpipe 渲染线程数（留出 vCPU 给 ROS）'
+        required: false
+        default: '2'
       unity_boot_wait:
         description: '等 Unity 监听 9001 的超时 [s]'
         required: false
@@ -29,7 +44,7 @@ on:
       capfps:
         description: '录屏帧率'
         required: false
-        default: '10'
+        default: '6'
       upscale:
         description: '上采样交付分辨率（留空 = 不上采样）'
         required: false
@@ -65,8 +80,9 @@ jobs:
     # 容器给的是原版 focal + Noetic，所以既没有 Rosetta（Mono 断言崩溃的根因），
     # 也不用在 22.04 上折腾 RoboStack。
     #
-    # --cap-add=SYS_NICE : 让 nice -n -5 生效（Docker 默认能力集不含它），
-    #                      把 CPU 优先让给 Unity 渲染器。
+    # --cap-add=SYS_NICE : 让控制栈的 `nice -n -5` 生效（Docker 默认能力集不含它）。
+    #                      ⚠️ Run 8 之前这个 cap 是用在 **Unity** 上的 —— 方向错了：
+    #                      渲染器优先会造成控制器被饿（实测控制回路只有 41 Hz / 设 200）。
     # --shm-size=2g      : Unity 默认的 64 MB /dev/shm 不够。
     container:
       image: ros:noetic-ros-base
@@ -125,6 +141,9 @@ jobs:
           ARM_KEY: ${{ inputs.arm_key }}
           BAG_ONLY: ${{ inputs.bag_only }}
           PUBLISH_IMU: ${{ inputs.publish_imu }}
+          CTRL_NICE: ${{ inputs.ctrl_nice }}
+          UNITY_NICE: ${{ inputs.unity_nice }}
+          LP_NUM_THREADS: ${{ inputs.lp_threads }}
         run: |
           # 没有这行，`... | tee log` 的退出码会被 tee 吃掉 ——
           # 上一轮就是因此「空产物 + conclusion=success」。
@@ -153,6 +172,7 @@ jobs:
             out/*.bag
             out/*.mp4
             out/*.png
+            out/roslog/**
           retention-days: 14
           if-no-files-found: warn
 
@@ -187,6 +207,12 @@ jobs:
               cat out/metrics.json || true
               echo '```'
             fi
+            echo
+            echo '### 控制器自报（roslog —— Run 8 之前一直没被收进产物）'
+            echo '```'
+            grep -ah 'Control loop rate\|Controller engaged\|First desired state received' \
+              out/roslog/*/*.log 2>/dev/null | head -6 || echo '(没找到)'
+            echo '```'
             echo
             echo '### 产物清单'
             echo '```'

@@ -57,8 +57,28 @@ DISP="${DISP:-:99}"
 # 是每帧固定开销而不是光栅化。所以这里保持 640x400 只为少占点 CPU，别指望提帧率。
 RES="${RES:-640x400}"
 XVFB_RES="${XVFB_RES:-$RES}"
-CAPFPS="${CAPFPS:-10}"
+# 录屏帧率。交付物要的是「看得到飞行」，不是「看细节」；而 X11 抓屏 + x264 也要吃 CPU。
+# Run 8 实测：控制回路只跑到 41 Hz（目标 200），且 /current_state 在**墙钟**上出现
+# p95=105 ms / max=865 ms 的成串空档 —— 典型的进程被抢占后「攒一批再冲」。所以降帧。
+CAPFPS="${CAPFPS:-6}"
 UPSCALE="${UPSCALE:-}"
+
+# ---------------------------------------------------------------------------
+# CPU 分配（Run 8 之后新增，本轮的核心变量）
+# ---------------------------------------------------------------------------
+# Run 8 把链路跑通了，但也暴露出**我们在主动饿死控制器**：
+#   · Unity 被 `nice -n -5`（**提**优先级）—— 渲染器优先于控制器，方向是反的；
+#   · `LP_NUM_THREADS=$(nproc)` = 4，llvmpipe 软件光栅化把 4 个 vCPU 全占了。
+# 后果（都从 Run 8 的 bag 里量出来）：
+#   · /rotor_speed_cmds 只有 2910 条 / 71.06 s = **41 Hz**（设定 200 Hz，期望约 14200 条）；
+#   · 控制器输出出现 >100 ms 的空档共 33.6 s，占全程 **47.3%** —— 这些时段整个控制
+#     回路没有输出，无人机在**开环**飞；
+#   · /current_state 有 349 次送达空档 > 83 ms（姿态环时间常数），占 9.3%。
+# 所以这一轮把优先级倒过来：控制栈（桥接 + 控制器 + 规划器）**提**优先级，
+# Unity 与录屏**降**优先级并限制线程数。
+CTRL_NICE="${CTRL_NICE:-5}"     # 控制栈 nice 值（正数 = 降 5 档）
+UNITY_NICE="${UNITY_NICE:-10}"  # Unity/录屏 nice 值（正数 = 降 10 档）
+LP_NUM_THREADS="${LP_NUM_THREADS:-2}"  # llvmpipe 渲染线程数，留 2 个 vCPU 给 ROS
 
 # 控制回路频率。官方 lab3 起点代码写死 1000 Hz，但 Unity/TESSE 的物理只有 ~50 Hz，
 # 且每条命令都要过一次 socket 桥接。在 CPU 吃紧的 runner 上 1000 Hz 只是把 CPU
@@ -78,7 +98,11 @@ RACE_TIMEOUT="${RACE_TIMEOUT:-900}"
 # 注意用 `${ARM_KEY-w}` 而不是 `${ARM_KEY:-w}` —— 显式传空串要能真的表示「不发键」。
 ARM_KEY="${ARM_KEY-w}"
 ARM_DELAY="${ARM_DELAY:-5}"
-UNITY_WIN_NAME="${UNITY_WIN_NAME:-lab4}"
+# Unity 窗口标题。**Run 8 实测真名是 `tesse_vnav_scenes`，不是构建名 `lab4`**
+#（windows.txt 里两个窗口：1294 无标题、2097166 标题 tesse_vnav_scenes）。
+# 原来写 'lab4' 匹配不到，靠「找不到就对焦点窗口发键」的兜底才把 W 送进去
+#（无人机确实上电了 —— 5/12 门命中）。改成真名，去掉这份运气成分。
+UNITY_WIN_NAME="${UNITY_WIN_NAME:-tesse_vnav_scenes}"
 
 # lag_probe 采样时长 [s]；<=0 表示不跑
 LAG_DURATION="${LAG_DURATION:-120}"
@@ -378,7 +402,7 @@ ls -l "$WS/src/tesse_ros_bridge/src/tesse_ros_bridge/"*.py | indent
 # 而 **enum34 只有 py2 能装**（py3 上 pip 直接报错）。所以：先手动备齐前三个，
 # 再用 --no-deps 装本体。
 say "装 tesse-interface（跳过 py2-only 的 enum34）"
-pip3 install -q numpy defusedxml Pillow || warn "numpy/defusedxml/Pillow 有告警"
+pip3 install -q numpy defusedxml Pillow rosbags || warn "numpy/defusedxml/Pillow/rosbags 有告警"
 pip3 install -q -e "$BRIDGE_SRC/tesse-interface" --no-deps \
   || die "pip install tesse-interface 失败"
 # pip 侧的模块自检。这三个缺任何一个，桥接起节点都会 ModuleNotFoundError：
@@ -462,7 +486,7 @@ say "门位姿目录（simulator_data_directory）: $SIM_DATA"
 export DISPLAY="$DISP"
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
-export LP_NUM_THREADS="$JOBS"
+export LP_NUM_THREADS="$LP_NUM_THREADS"
 
 pkill -f "Xvfb $DISP" 2>/dev/null || true
 say "启动 Xvfb $DISP（${XVFB_RES}x24）"
@@ -482,16 +506,22 @@ if command -v glxinfo >/dev/null 2>&1; then
     | grep -iE "OpenGL (renderer|version)" | indent || true
 fi
 
-# 容器默认不带 CAP_SYS_NICE，`nice -n -5` 会 EPERM。先探一下再决定带不带。
-NICE=()
-if nice -n -5 true 2>/dev/null; then
-  NICE=(nice -n -5)
+# ---- CPU 优先级：这一轮把方向**倒过来**（见文件头「CPU 分配」段的实测数据） ----
+# Unity / 录屏 → **降**优先级（正数 nice，不需要任何 capability）
+# 控制栈     → **提**优先级（负 nice，需要 CAP_SYS_NICE，容器不一定给 → 先探）
+UNITY_NICE_CMD=(nice -n "$UNITY_NICE")
+CNICE=(nice -n 0)   # 兜底：`nice -n 0` 是合法的 no-op
+if nice -n "-$CTRL_NICE" true 2>/dev/null; then
+  CNICE=(nice -n "-$CTRL_NICE")
+  note "控制栈优先级：nice -n -$CTRL_NICE（生效）"
 else
-  warn "无法降 niceness（容器缺 CAP_SYS_NICE）—— Unity 不加优先级"
+  warn "无法给控制栈提优先级（容器缺 CAP_SYS_NICE）—— 控制栈按默认 nice 跑"
 fi
+# 注：CNICE 故意**不留空**（退化成 `nice -n 0`）。空数组在 `set -u` 下用
+# `"${CNICE[@]}"` 展开，老 bash（<4.4）会报 unbound variable —— 见 Run 4 的教训。
 
-say "启动 Unity（窗口 ${RES}，force-glcore）"
-( cd "$UNITY_DIR" && exec "${NICE[@]}" "./$UNITY_NAME" \
+say "启动 Unity（窗口 ${RES}，force-glcore，nice +$UNITY_NICE，llvmpipe 线程 $LP_NUM_THREADS）"
+( cd "$UNITY_DIR" && exec "${UNITY_NICE_CMD[@]}" "./$UNITY_NAME" \
     -logFile "$OUT/unity.log" \
     -screen-fullscreen 0 -screen-width "${RES%x*}" -screen-height "${RES#*x}" \
     -force-glcore \
@@ -579,7 +609,7 @@ say "roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch（publish_imu=$PUB
 # 地址发 metadata 的 → 直接丢 /current_state，整条链路废掉。
 #
 # 其余参数一律用 launch 默认，只动 publish_imu（理由见文件头参数区）。
-roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch \
+"${CNICE[@]}" roslaunch tesse_ros_bridge tesse_quadrotor_bridge.launch \
     publish_imu:="$PUBLISH_IMU" \
     > "$OUT/bridge.log" 2>&1 &
 PIDS+=("$!")
@@ -639,12 +669,16 @@ fi
 # 7. 起控制器 → 开录 → 发门位姿（竞速开始）
 # =============================================================================
 say "roslaunch trajectory_generation traj_following.launch（trajectory_generation_node + controller_node）"
-roslaunch trajectory_generation traj_following.launch > "$OUT/traj_following.log" 2>&1 &
+# ⚠️ controller_node 在这个 launch 里**没有 output=\"screen\"** → 它自己的日志
+#（含 "Control loop rate: %f Hz" 与 "First desired state received"）落在
+# $HOME/.ros/log/ 下，**不会**进 traj_following.log。所以跑完会把 .ros/log 一起收进产物。
+"${CNICE[@]}" roslaunch trajectory_generation traj_following.launch \
+    > "$OUT/traj_following.log" 2>&1 &
 PIDS+=("$!")
 sleep 5
 
 say "开始录 rosbag → $OUT/race.bag"
-rosbag record -O "$OUT/race.bag" /current_state /desired_state /rotor_speed_cmds \
+"${CNICE[@]}" rosbag record -O "$OUT/race.bag" /current_state /desired_state /rotor_speed_cmds \
     > "$OUT/rosbag.log" 2>&1 &
 BAG_PID=$!
 PIDS+=("$BAG_PID")
@@ -655,9 +689,10 @@ if [ "$BAG_ONLY" = "1" ]; then
   note "BAG_ONLY=1 —— 跳过录屏（省 CPU）"
 else
   say "开始录屏 → $OUT/race_video.mp4（${CAPFPS} fps @ $RES）"
-  ffmpeg -y -loglevel warning -f x11grab -framerate "$CAPFPS" \
+  # 录屏降到最低优先级 + 只用 1 个编码线程：它是纯取证用途，不该和控制器抢 CPU。
+  nice -n "$UNITY_NICE" ffmpeg -y -loglevel warning -f x11grab -framerate "$CAPFPS" \
       -video_size "$RES" -i "$DISP" \
-      -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -an \
+      -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -an -threads 1 \
       "$OUT/race_video.mp4" > "$OUT/ffmpeg.log" 2>&1 &
   FFMPEG_PID=$!
   PIDS+=("$FFMPEG_PID")
@@ -676,13 +711,14 @@ PIDS+=("$!")
 
 if [ "${LAG_DURATION%.*}" -gt 0 ] 2>/dev/null; then
   say "并行跑 lag_probe（${LAG_DURATION}s）—— 量 /current_state 真实滞后"
-  python3 "$BUNDLE/headless/lag_probe.py" --duration "$LAG_DURATION" \
+  # 纯观测者，**降到最低优先级**：它是取证用的，绝不能和控制器抢 CPU。
+  nice -n "$UNITY_NICE" python3 "$BUNDLE/headless/lag_probe.py" --duration "$LAG_DURATION" \
       --out "$OUT/lag_probe" > "$OUT/lag_probe.log" 2>&1 &
   PIDS+=("$!")
 fi
 
 say "roslaunch planner_pkg traj_gen.launch（发门位姿 → 竞速开始）"
-roslaunch planner_pkg traj_gen.launch simulator_data_directory:="$SIM_DATA" \
+"${CNICE[@]}" roslaunch planner_pkg traj_gen.launch simulator_data_directory:="$SIM_DATA" \
     > "$OUT/traj_gen.log" 2>&1 &
 PIDS+=("$!")
 
@@ -711,6 +747,21 @@ else
   warn "没有生成 bag —— 看 $OUT/rosbag.log"
 fi
 
+# ROS 自己的日志目录也收进产物。
+# 起因：`traj_following.launch` 里 controller_node **没有** output="screen"，
+# 于是它自己的 `ROS_INFO("Control loop rate: %f Hz")` 与
+# `First desired state received - controller engaged.` 只落在 $HOME/.ros/log/ 下，
+# **从来没进过产物** —— Run 8 想核「控制器实际读到多少 Hz」时发现无据可查，
+# 只能靠 bag 里 /rotor_speed_cmds 的条数反推（290 条/71 s → 41 Hz，而设定是 200 Hz）。
+if [ -d "$HOME/.ros/log" ]; then
+  rm -rf "$OUT/roslog"; mkdir -p "$OUT/roslog"
+  cp -r "$HOME/.ros/log/." "$OUT/roslog/" 2>/dev/null || true
+  note "已收 $HOME/.ros/log → $OUT/roslog"
+  say "控制器自报行（从 roslog 里挑出来直接看）："
+  grep -ah "Control loop rate\|Controller engaged\|First desired state received" \
+      "$OUT/roslog"/*/*.log 2>/dev/null | head -6 | indent || true
+fi
+
 # =============================================================================
 # 9. 分析
 # =============================================================================
@@ -735,6 +786,20 @@ if [ -f "$BAGF" ]; then
     cat "$OUT/osc_report.txt" | indent
   else
     warn "osc_report 失败，见 $OUT/osc.log"
+  fi
+
+  # 控制回路**实际**节拍。Run 8 才发现这个指标一直没人看：设定 200 Hz，
+  # 实测 /rotor_speed_cmds 只有 41 Hz，而控制器输出有 47% 的时间处于 >100 ms 空档。
+  # 它同时能区分两种解释：CPU 被抢（节拍随优先级变化）vs /clock 粒度封顶
+  # （Unity 只有 ~20 fps，/clock 21.5 Hz，仿真时间下的定时器最多也就那个量级）。
+  say "ctrl_rate.py（控制回路真实节拍 / 状态送达空档）"
+  if [ -f "$BUNDLE/headless/ctrl_rate.py" ]; then
+    if python3 "$BUNDLE/headless/ctrl_rate.py" "$BAGF" \
+          > "$OUT/ctrl_rate.txt" 2>&1; then
+      cat "$OUT/ctrl_rate.txt" | indent
+    else
+      warn "ctrl_rate 失败，见 $OUT/ctrl_rate.txt"
+    fi
   fi
 fi
 
