@@ -1,0 +1,156 @@
+name: official-race
+
+# 手动触发。默认参数 = 「官方原样 + 两处已认过的修复（have_desired / hz=200）」，
+# 即 Run 1：只换机器（2 vCPU → 4 vCPU），不加任何新代码，用来隔离
+# 「发散到底是不是单纯 CPU 不够」这一个变量。
+on:
+  workflow_dispatch:
+    inputs:
+      res:
+        description: 'Unity 渲染分辨率 WxH'
+        required: false
+        default: '640x400'
+      ctrl_hz:
+        description: '控制回路频率 /hz（官方起点是 1000）'
+        required: false
+        default: '200'
+      unity_boot_wait:
+        description: '等 Unity 监听 9001 的超时 [s]'
+        required: false
+        default: '240'
+      race_timeout:
+        description: '竞速墙钟兜底超时 [s]'
+        required: false
+        default: '900'
+      lag_duration:
+        description: 'lag_probe 采样时长 [s]（0 = 不跑）'
+        required: false
+        default: '120'
+      capfps:
+        description: '录屏帧率'
+        required: false
+        default: '10'
+      upscale:
+        description: '上采样交付分辨率（留空 = 不上采样）'
+        required: false
+        default: '1280x800'
+      arm_key:
+        description: 'Unity 上电键（留空 = 不发键）'
+        required: false
+        default: 'w'
+      bag_only:
+        description: '1 = 只出 bag 不录屏（省 CPU，纯算法迭代用）'
+        required: false
+        default: '0'
+      probe_only:
+        description: '1 = 只跑快探针（不竞速），0 = 跑完整链路'
+        required: false
+        default: '0'
+
+# 最低读写权限：读仓 + 上传 artifact
+permissions:
+  contents: read
+
+jobs:
+  race:
+    name: 官方 Unity 竞速
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    # 直接跑在 ros:noetic-ros-base 里：runner 本身是原生 x86_64，
+    # 容器给的是原版 focal + Noetic，所以既没有 Rosetta（Mono 断言崩溃的根因），
+    # 也不用在 22.04 上折腾 RoboStack。
+    #
+    # --cap-add=SYS_NICE : 让 nice -n -5 生效（Docker 默认能力集不含它），
+    #                      把 CPU 优先让给 Unity 渲染器。
+    # --shm-size=2g      : Unity 默认的 64 MB /dev/shm 不够。
+    container:
+      image: ros:noetic-ros-base
+      options: --user root --shm-size=2g --cap-add=SYS_NICE
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息（私有仓 2 vCPU / 公开仓 4 vCPU）
+        run: |
+          echo "vCPU    = $(nproc)"
+          free -m | awk '/Mem:/{printf "内存    = %s MB\n", $2}'
+          grep -E '^PRETTY_NAME' /etc/os-release || true
+          echo "工作区  = $GITHUB_WORKSPACE"
+          echo "--- 可用的 ROS 包（前 10）"
+          ls /opt/ros/noetic/share | head -10
+
+      - name: 快探针（probe_only=1）
+        if: ${{ inputs.probe_only == '1' }}
+        env:
+          OUT: ${{ github.workspace }}/out
+          BUNDLE: ${{ github.workspace }}/lab4
+          RES: ${{ inputs.res }}
+          XVFB_RES: ${{ inputs.res }}
+          UNITY_BOOT_WAIT: ${{ inputs.unity_boot_wait }}
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT"
+          bash ci/probe_unity.sh 2>&1 | tee "$OUT/probe_console.log"
+
+      - name: 完整竞速链路
+        if: ${{ inputs.probe_only != '1' }}
+        env:
+          OUT: ${{ github.workspace }}/out
+          BUNDLE: ${{ github.workspace }}/lab4
+          RES: ${{ inputs.res }}
+          XVFB_RES: ${{ inputs.res }}
+          CTRL_HZ: ${{ inputs.ctrl_hz }}
+          UNITY_BOOT_WAIT: ${{ inputs.unity_boot_wait }}
+          RACE_TIMEOUT: ${{ inputs.race_timeout }}
+          LAG_DURATION: ${{ inputs.lag_duration }}
+          CAPFPS: ${{ inputs.capfps }}
+          UPSCALE: ${{ inputs.upscale }}
+          ARM_KEY: ${{ inputs.arm_key }}
+          BAG_ONLY: ${{ inputs.bag_only }}
+        run: |
+          # 没有这行，`... | tee log` 的退出码会被 tee 吃掉 ——
+          # 上一轮就是因此「空产物 + conclusion=success」。
+          set -o pipefail
+          mkdir -p "$OUT"
+          bash ci/official_race.sh 2>&1 | tee "$OUT/console.log"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-race
+          path: out/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 结论摘要
+        if: always()
+        run: |
+          {
+            echo "## 官方 Unity 竞速 — 摘要"
+            echo
+            echo "- vCPU: $(nproc)"
+            echo "- run: $GITHUB_RUN_ID  触发参数见上方 job 配置"
+            echo
+            if [ -f out/lag_probe.txt ]; then
+              echo '### /current_state 滞后实测（★ 核心指标）'
+              echo '```'
+              sed -n '1,60p' out/lag_probe.txt
+              echo '```'
+            else
+              echo '_没有 lag_probe.txt_'
+            fi
+            echo
+            if [ -f out/metrics.json ]; then
+              echo '### metrics.json'
+              echo '```json'
+              cat out/metrics.json
+              echo '```'
+            fi
+            echo
+            echo '### 产物清单'
+            echo '```'
+            ls -la out/ 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

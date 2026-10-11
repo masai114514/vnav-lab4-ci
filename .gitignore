@@ -1,0 +1,15 @@
+# 运行产物（由 CI 生成后作为 artifact 上传，不进仓）
+out/
+*.log
+
+# 本地缓存
+__pycache__/
+*.pyc
+.DS_Store
+
+# 下下来的 Unity 与中间件
+lab4.zip
+unity/
+
+# 取回的 artifact 落地目录
+official_race_r*/
