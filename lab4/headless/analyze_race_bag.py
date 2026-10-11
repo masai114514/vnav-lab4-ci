@@ -290,18 +290,22 @@ def main():
         # 渲染帧级的采样保持，几千 mm 以内都还算"在跟轨迹"，上万 mm 就是发散。
         # 早先这里只判 `>150 mm` 就打印"复现成功 ✓"，把 9195 mm 也判成了成功。
         rmse = res["pos_rmse_mm"]
-        gates = res.get("gates_passed")
-        if rmse <= 1500 and (gates is None or gates >= 10):
+        # ⚠️ 局部变量名**不要**叫 gates —— 会把外面那个门位姿数组覆盖成 int，
+        # 于是第 313 行 plot(data, gates, ...) 拿到 int，在 `len(gates)` 处炸：
+        #     TypeError: object of type 'int' has no len()
+        # 症状很隐蔽：metrics.json 已经写好了，只有 race_tracking.png 静默消失。
+        n_passed = res.get("gates_passed")
+        if rmse <= 1500 and (n_passed is None or n_passed >= 10):
             verdict = "复现成功 ✓（与离线基线同量级）"
         elif rmse <= 3000:
             verdict = "勉强在跟轨迹，但明显差于离线基线（实时链路开销）"
         else:
             verdict = "★ 发散 —— 实测轨迹没跟上期望轨迹，需排查实时链路"
         print("  实测 %.1f mm —— %s" % (rmse, verdict))
-        if gates is not None:
+        if n_passed is not None:
             print("  过门 %d/%d —— %s"
-                  % (gates, res["gates_total"],
-                     "完整一圈" if gates == res["gates_total"]
+                  % (n_passed, res["gates_total"],
+                     "完整一圈" if n_passed == res["gates_total"]
                      else "未跑完整圈（发散会撞门框/飞出场外）"))
     print("=" * 74)
 
