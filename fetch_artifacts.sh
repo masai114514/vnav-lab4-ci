@@ -67,13 +67,36 @@ say "元信息 → $DEST/run_meta.txt"
 grep -E "^(✓|X|✗|Status|Conclusion|run_id)" "$DEST/run_meta.txt" | head -5 || true
 
 # ---- 拉 artifact -----------------------------------------------------------
-say "下载 artifact '$ARTIFACT' ..."
-if gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT" --dir "$DEST"; then
-  say "下载完成"
+# 先问一下大小。100 MB+ 的 artifact 走 `gh run download` 容易超时/被杀，
+# 所以下面备了一条 REST zip 端点的回退路径。
+AID="$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+        --jq ".artifacts[] | select(.name==\"$ARTIFACT\") | .id" 2>/dev/null | head -1 || true)"
+if [ -n "$AID" ]; then
+  SZB="$(gh api "repos/$REPO/actions/artifacts/$AID" --jq '.size_in_bytes' 2>/dev/null || echo '?')"
+  say "artifact id=$AID  size=${SZB} bytes ($(( ${SZB:-0} / 1048576 )) MB)"
 else
-  warn "按名字下载失败，退回「拉全部 artifact」"
-  gh run download "$RUN_ID" --repo "$REPO" --dir "$DEST" || die "artifact 下载失败"
+  warn "没查到名为 '$ARTIFACT' 的 artifact（可能没传成功）"
 fi
+
+say "下载 artifact '$ARTIFACT' ..."
+ok=0
+if gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT" --dir "$DEST"; then
+  ok=1
+fi
+
+if [ "$ok" != 1 ] && [ -n "$AID" ]; then
+  warn "gh run download 失败 —— 退回 REST zip 端点（大 artifact 更稳）"
+  # zip 落在系统临时目录，别往 Desktop 下写中间文件
+  TMPZ="$(mktemp -d)/artifact.zip"
+  if curl -fL --retry 3 --retry-delay 5 --max-time 1800 \
+        -H "Authorization: Bearer $(gh auth token)" \
+        -H "Accept: application/vnd.github+json" \
+        -o "$TMPZ" \
+        "https://api.github.com/repos/$REPO/actions/artifacts/$AID/zip"; then
+    unzip -q -o "$TMPZ" -d "$DEST" && ok=1
+  fi
+fi
+[ "$ok" = 1 ] || die "artifact 下载失败"
 
 # ---- 整理：artifact 可能带一层 out/ ----------------------------------------
 if [ -d "$DEST/out" ]; then

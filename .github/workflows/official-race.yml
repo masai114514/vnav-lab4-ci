@@ -141,7 +141,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: official-race
-          path: out/
+          # 只传「有意义的结果」。**不要**写成 `path: out/` ——
+          # out/ 里还躺着 lab4.zip(52 MB) 与解包出来的 Unity 构建(几百 MB)，
+          # 实测那样每趟 artifact 109 MB，全是中间垃圾：下载慢到被杀、
+          # 还白占配额。结果类文件总共只有几 MB。
+          path: |
+            out/*.log
+            out/*.txt
+            out/*.json
+            out/*.csv
+            out/*.bag
+            out/*.mp4
+            out/*.png
           retention-days: 14
           if-no-files-found: warn
 
