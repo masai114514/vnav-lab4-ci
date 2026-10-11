@@ -28,6 +28,9 @@ if [ -n "${2:-}" ]; then
   DEST="$2"
 elif [ -n "${DEST:-}" ]; then
   : # 用外部传入的
+elif [ -n "$RUN_ID" ]; then
+  # 目录名带上 run_id 尾部，避免「同一天两个 run 互相覆盖」（踩过：Run 10 覆盖 Run 8）
+  DEST="$LAB4/official_race_run${RUN_ID}"
 else
   DEST="$LAB4/official_race_r$(date +%m%d)"
 fi

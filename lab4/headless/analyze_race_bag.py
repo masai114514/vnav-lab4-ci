@@ -31,6 +31,7 @@ import json
 import math
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -64,13 +65,86 @@ def load_gates(csv_path):
 
 
 # ---------------------------------------------------------------------------
+def _read_bag_rosbags(bag_path):
+    """没有 ROS `rosbag` 时的回退后端（纯 pip 包 rosbags）。
+
+    本机 macOS 没装 ROS，只有 CI 容器里有。两个后端的输出结构必须一致，
+    否则同一份 bag 在两边画出的图会不一样。
+    """
+    from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
+
+    def _sec(d):
+        # builtin_interfaces/msg/Duration 没有 to_sec()
+        if hasattr(d, "to_sec"):
+            return d.to_sec()
+        return float(d.sec) + float(d.nanosec) * 1e-9
+
+    typestore = get_typestore(Stores.ROS1_NOETIC)
+    des_t, des_p, des_v = [], [], []
+    cur_t, cur_p, cur_v, cur_q = [], [], [], []
+    n_des = n_cur = 0
+    t0 = None
+    with AnyReader([Path(bag_path)], default_typestore=typestore) as reader:
+        conns = [c for c in reader.connections
+                 if c.topic in ("/desired_state", "/current_state")]
+        for conn, stamp_ns, raw in reader.messages(connections=conns):
+            m = reader.deserialize(raw, conn.msgtype)
+            if conn.topic == "/desired_state":
+                n_des += 1
+                tt = _sec(m.time_from_start)
+                if t0 is None:
+                    t0 = stamp_ns * 1e-9 - tt
+                if not m.transforms:
+                    continue
+                tr = m.transforms[0].translation
+                des_t.append(tt)
+                des_p.append((tr.x, tr.y, tr.z))
+                if m.velocities:
+                    vl = m.velocities[0].linear
+                    des_v.append((vl.x, vl.y, vl.z))
+                else:
+                    des_v.append((0.0, 0.0, 0.0))
+            else:
+                n_cur += 1
+                p = m.pose.pose.position
+                q = m.pose.pose.orientation
+                v = m.twist.twist.linear
+                cur_t.append(_sec(m.header.stamp))
+                cur_p.append((p.x, p.y, p.z))
+                cur_v.append((v.x, v.y, v.z))
+                cur_q.append((q.x, q.y, q.z, q.w))
+
+    out = dict(
+        n_desired=n_des, n_current=n_cur, t0=t0,
+        des_t=np.asarray(des_t, float),
+        des_p=np.asarray(des_p, float).reshape(-1, 3),
+        des_v=np.asarray(des_v, float).reshape(-1, 3),
+        cur_t=np.asarray(cur_t, float),
+        cur_p=np.asarray(cur_p, float).reshape(-1, 3),
+        cur_v=np.asarray(cur_v, float).reshape(-1, 3),
+        cur_q=np.asarray(cur_q, float).reshape(-1, 4),
+    )
+    order = np.argsort(out["des_t"])
+    for k in ("des_t", "des_p", "des_v"):
+        out[k] = out[k][order]
+    out["cur_tau"] = out["cur_t"] - (t0 if t0 is not None else 0.0)
+    return out
+
+
 def read_bag(bag_path):
     try:
-        import rosbag
+        import rosbag  # noqa: F401
     except ImportError:
-        print("错误：import rosbag 失败。请先 `source /opt/ros/noetic/setup.bash`。",
-              file=sys.stderr)
-        raise
+        try:
+            import rosbags  # noqa: F401
+        except ImportError:
+            print("错误：既没有 ROS 的 rosbag，也没有 pip 的 rosbags。"
+                  "容器里 `source /opt/ros/noetic/setup.bash`，"
+                  "本机 `pip install rosbags`。", file=sys.stderr)
+            raise
+        print("[analyze] 没有 ROS rosbag，改用 rosbags 后端读 bag", file=sys.stderr)
+        return _read_bag_rosbags(bag_path)
 
     des_t, des_p, des_v = [], [], []
     cur_t, cur_p, cur_v, cur_q = [], [], [], []
@@ -196,7 +270,7 @@ def plot(data, gates, path, title="LAB4 drone race — headless reproduction"):
     ax.plot(data["des_p"][:, 0], data["des_p"][:, 1], "-", lw=1.4,
             color="#1565c0", label="desired (min-snap)")
     ax.plot(data["cur_p"][:, 0], data["cur_p"][:, 1], "-", lw=1.1,
-            color="#c62828", alpha=0.85, label="actual (plant)")
+            color="#c62828", alpha=0.85, label="actual (sim)")
     if gates is not None and len(gates):
         ax.plot(gates[:, 0], gates[:, 1], "s", ms=6, mfc="none",
                 mec="#2e7d32", mew=1.4, label="gates")
@@ -253,6 +327,7 @@ def main():
     ap.add_argument("--bag", required=True)
     ap.add_argument("--out", default="metrics.json")
     ap.add_argument("--plot", default="")
+    ap.add_argument("--title", default="LAB4 drone race — headless reproduction")
     ap.add_argument("--gates-csv", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "sim_data", "StreamingAssets", "vnav-2020-lab4_static_tfs.csv"))
@@ -314,7 +389,7 @@ def main():
     print("[analyze] 指标已写入: %s" % args.out)
 
     if args.plot:
-        plot(data, gates, args.plot)
+        plot(data, gates, args.plot, args.title)
     return 0
 
 

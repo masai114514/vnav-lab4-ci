@@ -86,14 +86,22 @@ def main():
     # ---- 【零】/clock：use_sim_time 下所有 ROS 定时器的驱动源 ----------------
     # 桥接的 spin() 是 `while not shutdown: clock_cb(None)`，每轮同步 UDP 往返
     # 向 Unity 要 metadata 再发一次 /clock ⇒ /clock 频率 = Unity 帧率。
-    # 每跳多少仿真秒 = Unity 固定物理步长。控制器的 ros::Timer 挂在 ROS 时间上，
-    # 只能跟着 /clock 跳 ⇒ **控制环频率上限 = /clock 频率**，与 /hz 无关。
+    # 每跳多少仿真秒 = Unity 固定物理步长。
+    #
+    # ⚠️ 实测更正：**/clock 频率不是控制环的频率上限**。
+    #    控制器的 ros::Timer 挂在 ROS 时间上，/clock 一次跳 20 ms 时，
+    #    5 ms 的定时器会在这一跳里**补发多次**。Run 10 实测 /clock 只有
+    #    35.5 Hz，控制环却跑到 70.3 Hz（约 2 次/跳），所以
+    #    「控制频率 ≤ /clock 频率」这个直觉是错的（我们曾据此写下错误结论）。
+    #    /clock 的 20 ms 跳变真正的意义是：**状态采样保持的量化粒度**，
+    #    也就是控制精度的底噪，而不是频率天花板。
+    #    另外 /hz 在 use_sim_time 下是空旋钮 —— 调它不会让控制环真的跑到 200 Hz。
     tc = data.get("/clock")
     if tc is not None and tc.size >= 3:
         dtc = np.diff(tc) * 1000.0
         span = tc[-1] - tc[0]
         print()
-        print("【零】/clock —— 仿真时间节拍（= Unity 帧率；控制环的硬天花板）")
+        print("【零】/clock —— 仿真时间节拍（= Unity 帧率；状态采样保持的粒度）")
         print(f"  消息数 {tc.size}，墙钟跨度 {span:.2f} s → {tc.size/span:7.2f} Hz")
         cl = clock_sim_times(bag)
         if cl.size >= 3:
